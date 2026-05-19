@@ -65,9 +65,9 @@ def init_logger(name: str) -> RLEngineLogger:
         logger.addHandler(handler)
         logger.propagate = False
 
-    logger.info_once = MethodType(_info_once, logger)
-    logger.warn_once = MethodType(_warn_once, logger)
-    logger.info_on_rank = MethodType(_info_on_rank, logger)
+    logger.info_once = MethodType(_info_once, logger)  # type: ignore[attr-defined]
+    logger.warn_once = MethodType(_warn_once, logger)  # type: ignore[attr-defined]
+    logger.info_on_rank = MethodType(_info_on_rank, logger)  # type: ignore[attr-defined]
 
     return cast(RLEngineLogger, logger)
 
