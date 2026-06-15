@@ -1,8 +1,8 @@
 # Fused Linear LogP
 
 Fused Linear LogP computes per-token selected log-probabilities directly from
-**hidden states and the LM-head weight** — `log_softmax(hidden @ Wᵀ + b)[target]` —
-**without ever materializing the `[N, V]` logits**. It targets large-vocabulary RL
+hidden states and the LM-head weight `log_softmax(hidden @ Wᵀ + b)[target]`
+without ever materializing the `[N, V]` logits. It targets large-vocabulary RL
 post-training, where the `[B, S, V]` logits activation (and its gradient) dominate
 memory. The forward streams the vocab in blocks through an online softmax; the
 backward recomputes the logit tiles instead of storing them, trading compute for
@@ -33,7 +33,7 @@ logp.sum().backward()  # gradients flow into hidden, lm_head_weight, bias
 
 | Backend | Wrapper | Status |
 | --- | --- | --- |
-| CUDA SM90 (Hopper) | `FusedLinearLogpSM90Op` | TMA-streamed, software-pipelined tensor-core forward (`mma.sync.m16n8k16`), online softmax in smem; chunked backward. Compiles for `sm_90a`; **validated fp32-accurate on H100.** Falls back to Triton/native for fp32/fp16 inputs or hidden dims not divisible by 32. |
+| CUDA SM90 (Hopper) | `FusedLinearLogpSM90Op` | TMA-streamed, Double Buffering, tensor-core forward (`mma.sync.m16n8k16`), online softmax in smem; chunked backward. Compiles for `sm_90a`; validated fp32-accurate on H100. Falls back to Triton/native for fp32/fp16 inputs or hidden dims not divisible by 32. |
 | CUDA / ROCm (Triton) | `TritonLinearLogpOp` | Triton online-softmax forward; Liger-style chunked backward (cuBLAS matmuls, deterministic). Phase 1. |
 | PyTorch native | `NativeLinearLogpOp` | Naive `F.linear` + `log_softmax` + `gather` reference; CPU / Triton-less fallback. |
 
@@ -47,37 +47,15 @@ is built with `KERNEL_ALIGN_FORCE_SM90=1` on an SM90 device (TMA/`sm_90a`), and
 the registry only selects it when `cc_major == 9` and the symbol is present. The
 forward kernel requires bf16 hidden/weight with `D % 32 == 0`; for any other input
 the op transparently falls back to the Triton (else native) backend. The backward
-reuses the deterministic chunked path.
-
-The forward is fp32-accurate (matches the fp32 reference to ~1e-3, and the Triton
-op's forward to ~1e-5 with bitwise-identical gradients) and **throughput-tuned**:
-it runs at **~2× the Triton online-softmax forward** on H100 (bf16, N=4096,
-D=2048) across `V ∈ {32768, 50257, 131072}`, while keeping the zero-`[N,V]`
-headline — peak forward memory is the per-CTA shared-memory tiles, independent of
-`V`. Two design choices get it there: **register-blocked M-tiling** (`BM = 256`
-rows/CTA, so the weight matrix is re-read only `N/BM` times from HBM) and
-**split-V** (the vocab loop is partitioned across `blockIdx.y` so the grid fills
-all SMs, each split emitting a partial online-softmax state that a tiny combine
-kernel merges). Remaining headroom: a register-resident softmax epilogue (drop the
-`[BM,BN]` smem logit round-trip) and warp-specialized TMA producers.
-
-The backward chunks over the token dimension: for each chunk it materializes only
-`[chunk, V]` logits, recomputes the softmax from scratch, and forms the three
-gradients with cuBLAS matmuls (`grad_hidden = dz @ W`, `grad_weight += dzᵀ @ X`).
-`grad_weight` is accumulated in sequential loop order, so it is **atomic-free and
-bitwise-deterministic** while peak backward memory stays `chunk·V` instead of `N·V`.
-
-The native op materializes the full `[N, V]` logits and is the correctness oracle;
-the Triton op is the portable, fp32-accurate baseline that the future CUDA generic,
-CUDA SM90 (TMA/WGMMA), and native ROCm backends are validated against. See the
-[design doc](../design/fused-linear-logp.md) for the phased plan.
+reuses the deterministic chunked path. The native op materializes the full `[N, V]` 
+logits and is the correctness oracle.
 
 ## Tensor Contract
 
 | Argument | Shape | Dtype | Requirements |
 | --- | --- | --- | --- |
 | `hidden` | `[N, D]` / `[B, S, D]` | bf16 / fp16 / fp32 | Differentiable; contiguous. |
-| `lm_head_weight` | `[V, D]` | bf16 / fp16 / fp32 | Differentiable; contiguous (row-major over V). |
+| `lm_head_weight` | `[V, D]` | bf16 / fp16 / fp32 | Differentiable; contiguous. |
 | `target_ids` | `[N]` / `[B, S]` | int | Token id per position, in `[0, V)`. |
 | `bias` | `[V]` | float | Optional; differentiable. |
 | Output | `[N]` / `[B, S]` | float32 | `z[target] − logsumexp(z)` per position. |
@@ -104,25 +82,40 @@ python benchmarks/benchmark_linear_logp.py
 python benchmarks/benchmark_linear_logp.py --configs "4096,2048,32768;4096,2048,131072"
 ```
 
-Indicative results (RTX PRO 6000, SM120, bf16, N=4096, D=2048; native vs Triton):
+Measured on an **NVIDIA H100 80GB** (SM90), bf16, N=4096, D=2048, CUDA 12.8.
 
-| shape (N×H×V) | fwd | fwd+bwd | peak fwd VRAM (native → Triton) |
+**Forward latency (ms) and peak forward VRAM:**
+
+| shape (N×D×V) | native | Triton | **SM90** | SM90 vs Triton | peak fwd VRAM (native → fused) |
+| --- | --- | --- | --- | --- | --- |
+| 4096×2048×32768 | 1.79 | 6.42 | **3.41** | **1.88×** | 1280 MB → **~0 MB** |
+| 4096×2048×50257 | 9.96 | 9.82 | **4.88** | **2.01×** | 1965 MB → **~0 MB** |
+| 4096×2048×131072 | 7.28 | 25.56 | **12.88** | **1.98×** | 5120 MB → **~0 MB** |
+
+**Forward + backward latency (ms):**
+
+| shape (N×D×V) | native | Triton | **SM90** |
 | --- | --- | --- | --- |
-| 4096×2048×32768 | 0.53× | 0.43× | 1280 MB → ~0 MB |
-| 4096×2048×50257 | 0.99× | 0.46× | 1965 MB → ~0 MB |
-| 4096×2048×131072 | 0.64× | 0.23× | 5120 MB → ~0 MB |
+| 4096×2048×32768 | 4.25 | 15.86 | 12.69 |
+| 4096×2048×50257 | 23.29 | 47.20 | 42.20 |
+| 4096×2048×131072 | 17.05 | 117.62 | 104.97 |
 
-The headline is memory: the native path allocates the `[N, V]` logits (forward peak
-scales with `V`), while the fused op streams them online — its forward peak is
-**independent of `V`**, and the chunked backward only ever holds `chunk·V`. The
-forward matmul keeps operands in their native dtype, so bf16/fp16 inputs run on
-tensor cores (fp32 accumulation) and the forward lands near cuBLAS parity; the fp32
-path stays full-precision (`input_precision="ieee"`) for its role as the tolerance
-reference. The backward runs at ~2–4× native: it recomputes the logits per chunk
-(native keeps the `[N, V]` it already materialized), which is the compute-for-memory
-trade. Closing that gap and the absolute forward latency are the job of the native
-CUDA generic / SM90 (TMA/WGMMA) backends in later phases; Phase 1 delivers the
-memory reduction and the correctness/tolerance baseline.
+**Memory**: the native path allocates the `[N, V]` logits (forward
+peak scales with `V`), while the fused op streams them online — its forward peak is
+just the per-CTA shared-memory tiles, **independent of `V`** (≈0 MB of activation),
+and the chunked backward only ever holds `chunk·V`. That freed memory is what lets
+you grow the batch or the CoT length.
+
+**Latency**: the SM90 forward runs at **~2× the memory-free Triton baseline**
+across the vocab range — from TMA double-buffering, register-blocked `mma.sync`
+M-tiling (`BM=256`, so the weight matrix is re-read `N/BM` times), and split-V over
+the grid. It also beats the materializing native path at moderate vocab (2.0× at
+V=50257); at the extremes the native cuBLAS GEMM is still faster in raw ms, but only
+by paying the 1.3–5 GB `[N, V]` allocation the fused op avoids. The backward is the
+shared deterministic chunked-recompute path (recomputes logit tiles rather than
+storing them), so the fused forward+backward already beats Triton's. Closing the
+remaining forward gap to native's cuBLAS GEMM (WGMMA, a register-resident softmax
+epilogue) and a fully fused CUDA backward are future work.
 
 ## Tests
 
