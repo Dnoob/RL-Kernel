@@ -131,7 +131,7 @@ class _RatioKLFunction(torch.autograd.Function):
         pol = policy_logits.contiguous().view(-1, V)
         ref = ref_logits.contiguous().view(-1, V)
         n_rows = pol.shape[0]
-        act = action_ids.contiguous().view(-1).to(torch.int64)
+        act = action_ids.contiguous().view(-1).clamp(0, V - 1).to(torch.int64)
         mask = attention_mask.contiguous().view(-1).to(torch.int32)
         old = old_logps.contiguous().view(-1).to(torch.float32)
 

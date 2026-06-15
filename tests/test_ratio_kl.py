@@ -147,6 +147,19 @@ def test_triton_backward_matches_native():
 
 
 @requires_triton_cuda
+def test_triton_no_grad_to_ref():
+    """The reference is frozen: the fused backward must not reach ref_logits."""
+    fused = TritonRatioKLOp()
+    pol, ref, act, mask, old = _inputs(seed=8, device="cuda")
+    pol = pol.clone().requires_grad_(True)
+    ref = ref.clone().requires_grad_(True)
+    r, k = fused(pol, ref, act, mask, old)
+    (r.sum() + k.sum()).backward()
+    assert pol.grad is not None
+    assert ref.grad is None
+
+
+@requires_triton_cuda
 def test_triton_backward_with_grad_scaling():
     """A non-unit upstream gradient must scale the policy-logits gradient linearly."""
     fused = TritonRatioKLOp()
@@ -181,6 +194,26 @@ def test_triton_masked_tokens_do_not_affect_active():
     assert torch.allclose(base_r[active], pert_r[active], atol=1e-5)
     assert torch.allclose(base_k[active], pert_k[active], atol=1e-5)
     assert torch.allclose(pert_r[inactive], torch.ones_like(pert_r[inactive]))
+
+
+@requires_triton_cuda
+def test_triton_handles_oob_action_ids():
+    """Out-of-range ids at masked positions must not fault; the fused op clamps
+    them (like the native op) and stays finite, agreeing on active outputs."""
+    native = NativeRatioKLOp()
+    fused = TritonRatioKLOp()
+    pol, ref, act, mask, old = _inputs(seed=9, device="cuda", valid_density=0.7)
+    act = act.clone()
+    inactive = ~mask.to(torch.bool)
+    act[inactive] = _VOCAB + 999  # garbage id at masked positions
+
+    r_t, k_t = fused(pol, ref, act, mask, old)
+    r_n, k_n = native(pol, ref, act, mask, old)
+
+    active = mask.to(torch.bool)
+    assert torch.isfinite(r_t).all() and torch.isfinite(k_t).all()
+    assert torch.allclose(r_t[active], r_n[active], atol=1e-4, rtol=1e-4)
+    assert torch.allclose(k_t[active], k_n[active], atol=1e-4, rtol=1e-4)
 
 
 # Registry dispatch (device-dependent backend selection)
