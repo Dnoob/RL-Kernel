@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import inspect
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Literal, Mapping, Optional
+from typing import Any, Callable, Iterator, Literal, Mapping, Optional
 
 import torch
 
@@ -15,6 +16,7 @@ from rl_engine.testing.reference_ops import selected_logprobs_reference
 StatelessForwardMode = Literal["reference", "reward", "both"]
 StatelessAttentionBackend = Literal["flash_attention_2", "sdpa", "eager", "model_default"]
 RewardAdapter = Callable[["StatelessForwardOutputs", "StatelessForwardInputs"], torch.Tensor]
+_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -110,7 +112,6 @@ class StatelessForwardExecutor:
 
     def score(self, inputs: StatelessForwardInputs) -> StatelessForwardResult:
         _validate_inputs(inputs, self.config)
-        no_cache_policy = configure_stateless_model(self.model, self.config)
 
         device = inputs.input_ids.device
         cuda_tracking = device.type == "cuda" and torch.cuda.is_available()
@@ -119,68 +120,72 @@ class StatelessForwardExecutor:
             torch.cuda.synchronize(device)
 
         started_at = time.perf_counter()
-        with torch.no_grad():
-            try:
-                raw_outputs, use_cache_passed = _run_no_cache_forward(self.model, inputs)
-                no_cache_policy["attention_backend_fallback"] = False
-            except Exception as exc:
-                if not _should_fallback_attention_backend(exc, self.config):
-                    raise
-                fallback_config = replace(self.config, attention_backend="eager")
-                fallback_policy = configure_stateless_model(self.model, fallback_config)
-                raw_outputs, use_cache_passed = _run_no_cache_forward(self.model, inputs)
-                no_cache_policy.update(fallback_policy)
-                no_cache_policy.update(
-                    {
-                        "attention_backend_requested": self.config.attention_backend,
-                        "attention_backend_fallback": True,
-                        "attention_backend_fallback_reason": (
-                            f"{type(exc).__name__}: {str(exc)[:200]}"
-                        ),
-                    }
-                )
-            kv_cache = extract_kv_cache_outputs(raw_outputs)
-            kv_cache_summary = summarize_tensor_tree(kv_cache)
-            if self.config.reject_kv_cache_outputs and kv_cache is not None:
-                raise ValueError(
-                    "stateless scoring received KV-cache outputs despite use_cache=False "
-                    f"({kv_cache_summary.tensor_count} tensors, "
-                    f"{kv_cache_summary.total_mb:.4f} MiB)."
-                )
-            outputs = StatelessForwardOutputs(
-                raw=raw_outputs,
-                logits=_extract_logits(raw_outputs),
-                kv_cache=kv_cache,
-            )
-
-            reference_logps: Optional[torch.Tensor] = None
-            rewards: Optional[torch.Tensor] = None
-            token_scores: Optional[torch.Tensor] = None
-
-            if self.config.mode in {"reference", "both"}:
-                if outputs.logits is None:
-                    raise ValueError("reference mode requires model outputs to expose logits")
-                reference_logps = score_reference_logprobs(
-                    outputs.logits,
-                    inputs,
-                    temperature=self.config.temperature,
-                    output_dtype=self.config.output_dtype,
-                )
-                if self.config.return_token_scores:
-                    token_scores = reference_logps
-
-            if self.config.mode in {"reward", "both"}:
-                rewards = score_rewards(
-                    outputs,
-                    inputs,
-                    reward_adapter=self.reward_adapter,
-                    output_dtype=self.config.output_dtype,
+        with _temporarily_configure_stateless_model(self.model, self.config) as no_cache_policy:
+            with torch.no_grad():
+                try:
+                    raw_outputs, use_cache_passed = _run_no_cache_forward(self.model, inputs)
+                    no_cache_policy["attention_backend_fallback"] = False
+                except Exception as exc:
+                    if not _should_fallback_attention_backend(exc, self.config):
+                        raise
+                    fallback_config = replace(self.config, attention_backend="eager")
+                    with _temporarily_configure_stateless_model(
+                        self.model,
+                        fallback_config,
+                    ) as fallback_policy:
+                        raw_outputs, use_cache_passed = _run_no_cache_forward(self.model, inputs)
+                    no_cache_policy.update(fallback_policy)
+                    no_cache_policy.update(
+                        {
+                            "attention_backend_requested": self.config.attention_backend,
+                            "attention_backend_fallback": True,
+                            "attention_backend_fallback_reason": (
+                                f"{type(exc).__name__}: {str(exc)[:200]}"
+                            ),
+                        }
+                    )
+                kv_cache = extract_kv_cache_outputs(raw_outputs)
+                kv_cache_summary = summarize_tensor_tree(kv_cache)
+                if self.config.reject_kv_cache_outputs and kv_cache is not None:
+                    raise ValueError(
+                        "stateless scoring received KV-cache outputs despite use_cache=False "
+                        f"({kv_cache_summary.tensor_count} tensors, "
+                        f"{kv_cache_summary.total_mb:.4f} MiB)."
+                    )
+                outputs = StatelessForwardOutputs(
+                    raw=raw_outputs,
+                    logits=_extract_logits(raw_outputs),
+                    kv_cache=kv_cache,
                 )
 
-            if self.config.detach_outputs:
-                reference_logps = _detach_optional(reference_logps)
-                rewards = _detach_optional(rewards)
-                token_scores = _detach_optional(token_scores)
+                reference_logps: Optional[torch.Tensor] = None
+                rewards: Optional[torch.Tensor] = None
+                token_scores: Optional[torch.Tensor] = None
+
+                if self.config.mode in {"reference", "both"}:
+                    if outputs.logits is None:
+                        raise ValueError("reference mode requires model outputs to expose logits")
+                    reference_logps = score_reference_logprobs(
+                        outputs.logits,
+                        inputs,
+                        temperature=self.config.temperature,
+                        output_dtype=self.config.output_dtype,
+                    )
+                    if self.config.return_token_scores:
+                        token_scores = reference_logps
+
+                if self.config.mode in {"reward", "both"}:
+                    rewards = score_rewards(
+                        outputs,
+                        inputs,
+                        reward_adapter=self.reward_adapter,
+                        output_dtype=self.config.output_dtype,
+                    )
+
+                if self.config.detach_outputs:
+                    reference_logps = _detach_optional(reference_logps)
+                    rewards = _detach_optional(rewards)
+                    token_scores = _detach_optional(token_scores)
 
         if cuda_tracking:
             torch.cuda.synchronize(device)
@@ -224,6 +229,10 @@ def score_reference_logprobs(
     labels = inputs.labels if inputs.labels is not None else inputs.input_ids
     if labels.shape != inputs.input_ids.shape:
         raise ValueError("labels shape must match input_ids shape")
+    if _completion_mask_starts_at_position_zero(inputs.completion_mask, device=logits.device):
+        raise ValueError(
+            "completion_mask[:, 0] must be False; completions cannot start at position 0"
+        )
 
     shifted_logits = logits[:, :-1, :]
     shifted_labels = labels[:, 1:]
@@ -357,6 +366,19 @@ def configure_stateless_model(
     }
 
 
+@contextmanager
+def _temporarily_configure_stateless_model(
+    model: torch.nn.Module,
+    config: StatelessForwardConfig,
+) -> Iterator[dict[str, float | int | str | bool]]:
+    saved = _model_config_snapshot(model, config)
+    policy = configure_stateless_model(model, config)
+    try:
+        yield policy
+    finally:
+        _restore_model_config_snapshot(saved)
+
+
 def extract_kv_cache_outputs(raw_outputs: Any) -> Optional[Any]:
     """Extract common cache-bearing output fields from model outputs."""
 
@@ -438,8 +460,13 @@ def _validate_inputs(inputs: StatelessForwardInputs, config: StatelessForwardCon
         raise ValueError(
             f"batch size {input_ids.shape[0]} exceeds max_batch_size {config.max_batch_size}"
         )
-    if config.mode in {"reference", "both"} and input_ids.shape[1] < 2:
-        raise ValueError("reference scoring requires sequence_len >= 2")
+    if config.mode in {"reference", "both"}:
+        if input_ids.shape[1] < 2:
+            raise ValueError("reference scoring requires sequence_len >= 2")
+        if _completion_mask_starts_at_position_zero(completion_mask, device=input_ids.device):
+            raise ValueError(
+                "completion_mask[:, 0] must be False; completions cannot start at position 0"
+            )
     if not bool(_bool_mask(completion_mask, device=input_ids.device).any().item()):
         raise ValueError("completion_mask must contain at least one active token")
 
@@ -480,7 +507,7 @@ def _should_fallback_attention_backend(
         "flash attention",
         "flash-attn",
         "flash_attn",
-        "kernels",
+        "flash attention kernels",
         "attn_implementation",
     )
     return any(marker in message for marker in markers)
@@ -539,8 +566,53 @@ def _bool_mask(mask: torch.Tensor, *, device: torch.device) -> torch.Tensor:
     return mask.to(device=device, dtype=torch.bool)
 
 
+def _completion_mask_starts_at_position_zero(
+    completion_mask: torch.Tensor,
+    *,
+    device: torch.device,
+) -> bool:
+    if completion_mask.shape[1] == 0:
+        return False
+    return bool(_bool_mask(completion_mask, device=device)[:, 0].any().item())
+
+
 def _detach_optional(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return tensor.detach() if tensor is not None else None
+
+
+def _model_config_snapshot(
+    model: torch.nn.Module,
+    config: StatelessForwardConfig,
+) -> list[tuple[Any, str, Any]]:
+    saved: list[tuple[Any, str, Any]] = []
+    for target in _model_config_targets(model):
+        if hasattr(target, "use_cache"):
+            saved.append((target, "use_cache", target.use_cache))
+        if config.attention_backend != "model_default":
+            saved.append(
+                (
+                    target,
+                    "attn_implementation",
+                    getattr(target, "attn_implementation", _MISSING),
+                )
+            )
+            saved.append(
+                (
+                    target,
+                    "_attn_implementation",
+                    getattr(target, "_attn_implementation", _MISSING),
+                )
+            )
+    return saved
+
+
+def _restore_model_config_snapshot(saved: list[tuple[Any, str, Any]]) -> None:
+    for target, attribute, previous in reversed(saved):
+        if previous is _MISSING:
+            if hasattr(target, attribute):
+                delattr(target, attribute)
+        else:
+            setattr(target, attribute, previous)
 
 
 def _model_config_targets(model: torch.nn.Module) -> list[Any]:

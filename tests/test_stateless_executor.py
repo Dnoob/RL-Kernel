@@ -29,10 +29,20 @@ class FakeReferenceModel(torch.nn.Module):
         self.config = SimpleNamespace(use_cache=True, _attn_implementation="eager")
         self.generation_config = SimpleNamespace(use_cache=True)
         self.use_cache_calls: list[bool | None] = []
+        self.config_use_cache_calls: list[bool | None] = []
+        self.generation_config_use_cache_calls: list[bool | None] = []
+        self.attn_implementation_calls: list[str | None] = []
 
     def forward(self, input_ids, attention_mask=None, use_cache=None):
         del attention_mask
         self.use_cache_calls.append(use_cache)
+        self.config_use_cache_calls.append(getattr(self.config, "use_cache", None))
+        self.generation_config_use_cache_calls.append(
+            getattr(self.generation_config, "use_cache", None)
+        )
+        self.attn_implementation_calls.append(
+            getattr(self.config, "_attn_implementation", None)
+        )
         return SimpleNamespace(
             logits=self.fixed_logits[: input_ids.shape[0], : input_ids.shape[1]],
             past_key_values=None,
@@ -154,9 +164,14 @@ def test_executor_runs_full_sequence_forward_with_use_cache_false_and_detaches_o
     assert result.metrics["attention_backend"] == "flash_attention_2"
     assert result.metrics["attention_backend_configured"] is True
     assert result.metrics["model_config_use_cache_disabled"] is True
-    assert model.config.use_cache is False
-    assert model.generation_config.use_cache is False
-    assert model.config._attn_implementation == "flash_attention_2"
+    assert model.config_use_cache_calls == [False]
+    assert model.generation_config_use_cache_calls == [False]
+    assert model.attn_implementation_calls == ["flash_attention_2"]
+    assert model.config.use_cache is True
+    assert model.generation_config.use_cache is True
+    assert model.config._attn_implementation == "eager"
+    assert not hasattr(model.config, "attn_implementation")
+    assert not hasattr(model.generation_config, "attn_implementation")
 
 
 def test_executor_falls_back_for_models_without_use_cache_argument():
@@ -270,6 +285,17 @@ def test_executor_rejects_shape_mismatches_empty_masks_and_invalid_config():
             )
         )
 
+    invalid_start_mask = inputs.completion_mask.clone()
+    invalid_start_mask[0, 0] = True
+    with pytest.raises(ValueError, match=r"completion_mask\[:, 0\]"):
+        executor.score(
+            StatelessForwardInputs(
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                completion_mask=invalid_start_mask,
+            )
+        )
+
     with pytest.raises(ValueError, match="completion_mask must contain"):
         executor.score(
             StatelessForwardInputs(
@@ -298,3 +324,41 @@ def test_importing_stateless_executor_does_not_import_heavy_optional_runtimes(mo
     assert module.StatelessForwardExecutor is not None
     for name in ("vllm", "deepspeed", "ray", "flash_attn"):
         assert name not in sys.modules
+
+
+def test_reference_scoring_rejects_completion_start_at_position_zero():
+    inputs = _inputs()
+    invalid_start_mask = inputs.completion_mask.clone()
+    invalid_start_mask[0, 0] = True
+    invalid_inputs = StatelessForwardInputs(
+        input_ids=inputs.input_ids,
+        attention_mask=inputs.attention_mask,
+        completion_mask=invalid_start_mask,
+    )
+
+    with pytest.raises(ValueError, match=r"completion_mask\[:, 0\]"):
+        score_reference_logprobs(_logits_for(inputs), invalid_inputs)
+
+
+def test_attention_backend_fallback_does_not_swallow_unrelated_kernel_errors():
+    class KernelFailureModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(use_cache=True, _attn_implementation="eager")
+            self.calls = 0
+
+        def forward(self, input_ids, attention_mask=None, use_cache=None):
+            del input_ids, attention_mask, use_cache
+            self.calls += 1
+            raise RuntimeError("CUDA kernels launch failed")
+
+    model = KernelFailureModel()
+    executor = StatelessForwardExecutor(model, StatelessForwardConfig(mode="reference"))
+
+    with pytest.raises(RuntimeError, match="CUDA kernels launch failed"):
+        executor.score(_inputs())
+
+    assert model.calls == 1
+    assert model.config.use_cache is True
+    assert model.config._attn_implementation == "eager"
+    assert not hasattr(model.config, "attn_implementation")

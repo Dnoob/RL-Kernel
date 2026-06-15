@@ -147,12 +147,12 @@ class DeepSpeedTrainingWorker(RolloutBatchMixin):
                 "training_device": str(self.device),
                 "deepspeed_engine": type(self.engine).__name__,
                 "deepspeed_zero_stage": self.config.zero_stage,
-                "advantage_mean": (
+                "active_advantage_mean_global": (
                     float(active_advantages.mean().detach().cpu().item())
                     if active_advantages.numel()
                     else 0.0
                 ),
-                "advantage_std": (
+                "active_advantage_std_global": (
                     float(active_advantages.std(unbiased=False).detach().cpu().item())
                     if active_advantages.numel()
                     else 0.0

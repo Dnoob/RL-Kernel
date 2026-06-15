@@ -325,8 +325,16 @@ def _validate_inputs(inputs: StatelessForwardInputs, config: PagedKVScoringConfi
         raise ValueError("completion_mask device must match input_ids device")
     if inputs.labels is not None and inputs.labels.device != input_ids.device:
         raise ValueError("labels device must match input_ids device")
-    if config.mode in {"reference", "both"} and input_ids.shape[1] < 2:
-        raise ValueError("reference scoring requires sequence_len >= 2")
+    if config.mode in {"reference", "both"}:
+        if input_ids.shape[1] < 2:
+            raise ValueError("reference scoring requires sequence_len >= 2")
+        if _completion_mask_starts_at_position_zero(
+            inputs.completion_mask,
+            device=input_ids.device,
+        ):
+            raise ValueError(
+                "completion_mask[:, 0] must be False; completions cannot start at position 0"
+            )
     if not bool(_bool_mask(inputs.completion_mask, device=input_ids.device).any().item()):
         raise ValueError("completion_mask must contain at least one active token")
 
@@ -385,6 +393,16 @@ def _extract_logits(raw_outputs: Any) -> Optional[torch.Tensor]:
 
 def _bool_mask(mask: torch.Tensor, *, device: torch.device) -> torch.Tensor:
     return mask.to(device=device, dtype=torch.bool)
+
+
+def _completion_mask_starts_at_position_zero(
+    completion_mask: torch.Tensor,
+    *,
+    device: torch.device,
+) -> bool:
+    if completion_mask.shape[1] == 0:
+        return False
+    return bool(_bool_mask(completion_mask, device=device)[:, 0].any().item())
 
 
 def _detach_optional(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:

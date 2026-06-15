@@ -43,7 +43,7 @@ CSV_COLUMNS = [
     "peak_reserved_mb",
     "paged_kv_baseline_mb",
     "kv_cache_output_mb",
-    "zero_kv_cache_savings_mb",
+    "savings_vs_local_reservation_baseline_mb",
     "status",
     "notes",
 ]
@@ -249,7 +249,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "peak_reserved_mb": f"{float(peak_reserved):.4f}" if peak_reserved != "" else "",
         "paged_kv_baseline_mb": "",
         "kv_cache_output_mb": f"{float(result.metrics['kv_cache_output_mb']):.4f}",
-        "zero_kv_cache_savings_mb": "",
+        "savings_vs_local_reservation_baseline_mb": "",
         "status": "pass",
         "notes": (
             f"use_cache_passed={result.metrics['use_cache_passed']};"
@@ -266,7 +266,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         savings_mb = float(paged_metrics["total_kv_cache_mb"]) - float(
             result.metrics["kv_cache_output_mb"]
         )
-        row["zero_kv_cache_savings_mb"] = f"{savings_mb:.4f}"
+        row["savings_vs_local_reservation_baseline_mb"] = f"{savings_mb:.4f}"
         row["notes"] += (
             f";paged_kv_elapsed_ms={float(paged_metrics['elapsed_ms']):.4f};"
             f"paged_kv_blocks={paged_metrics['paged_kv_blocks']};"
@@ -341,7 +341,7 @@ def _paged_kv_row(
         "peak_reserved_mb": f"{float(peak_reserved):.4f}" if peak_reserved != "" else "",
         "paged_kv_baseline_mb": f"{float(metrics['paged_kv_cache_reserved_mb']):.4f}",
         "kv_cache_output_mb": f"{float(metrics['model_kv_cache_output_mb']):.4f}",
-        "zero_kv_cache_savings_mb": "",
+        "savings_vs_local_reservation_baseline_mb": "",
         "status": "pass",
         "notes": (
             f"baseline_kind={metrics['baseline_kind']};"

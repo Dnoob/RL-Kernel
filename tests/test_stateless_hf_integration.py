@@ -96,7 +96,7 @@ def test_stateless_reference_scores_real_hf_causal_lm_without_kv_cache():
     assert result.metrics["kv_cache_output_tensors"] == 0
     assert result.metrics["attention_backend_fallback"] is True
     assert result.metrics["attention_backend"] == "eager"
-    assert model.config.use_cache is False
+    assert model.config.use_cache is True
 
 
 def test_stateless_reward_scores_real_hf_sequence_classifier():
